@@ -9,22 +9,49 @@ old comments in this repo at face value.
 
 ## Status
 
-**Confirmed working on real HealthOmics:** a nested entrypoint (`broken/`)
-importing one sibling subworkflow by relative path. Live-tested: the subworkflow
-task ran and produced real output. The theory that HealthOmics requires the
-entrypoint's imports to be relative to the repo root (unlike Cromwell) is
-**disproven** -- HealthOmics resolves relative imports the normal WDL way, same
-as Cromwell, at least for this case.
+**Confirmed working on real HealthOmics, live-tested, full execution:**
 
-**Still untested on real HealthOmics:** `deep-nested/` -- two layers of
-subworkflow nesting (a subworkflow that itself imports something) plus
-multiple imports at the entrypoint. This is the next thing to verify; the
-original bug report is still unexplained if this also turns out to work fine.
+- `broken/` -- a nested entrypoint importing one sibling subworkflow by
+  relative path. The theory that HealthOmics requires the entrypoint's
+  imports to be relative to the repo root (unlike Cromwell) is **disproven**
+  -- it resolves relative imports the normal WDL way, same as Cromwell.
+- `deep-nested/` -- two layers of subworkflow nesting (`align.wdl` imports
+  `trim.wdl`, which `main.wdl` never references directly) *and* multiple
+  imports at the entrypoint (`align.wdl` + `qc.wdl`). All three tasks ran and
+  produced correct output, including `trim`'s output flowing into
+  `align_task`. This rules out nesting depth and import count as
+  explanations too.
 
-**Confirmed, independent of the above:** a genuinely missing/unresolvable
-import (`missing-import/`) used to be silently swallowed into an empty input
-template by pipeline-service's local WDL parsing, rather than surfaced as an
-error. That fix is unrelated to the root-relative theory and remains in place.
+With both breadth and depth confirmed working, a general "HealthOmics drops
+subworkflows" platform limitation looks unlikely for same-directory or
+nested-subdirectory imports. But there's a shape none of the above actually
+tests, and it turns out to be the shape the original bug report's likely
+source repo (theiagen/public_health_bioinformatics) actually uses:
+
+- `category-import/` -- an import that goes **up and back down** across
+  sibling directory trees (`workflows/genomic_characterization/main.wdl`
+  importing `../../tasks/qc/task_qc.wdl`), rather than a sibling file in the
+  same directory. **Untested.** Theiagen's own contributing docs describe
+  exactly this convention -- tasks under `tasks/<category>/`, workflows under
+  `workflows/<category>/`, imported via `../` traversal -- which `broken/` and
+  `deep-nested/` don't exercise at all; they only import files sitting next to
+  the entrypoint.
+
+Why this matters: if AWS HealthOmics's git-based `CreateWorkflow` packaging
+does a sparse checkout or zip scoped to the entrypoint's own subdirectory
+(rather than the whole repo) -- the mirror image of the original, disproven
+theory -- same-directory imports would keep working exactly as observed, but
+`../` traversal trying to escape that subtree would fail to resolve and the
+import would get silently dropped. That's consistent with everything
+confirmed so far *and* gives a concrete mechanism matching real-world repo
+layout, unlike the nesting-depth/import-count theories that are now ruled
+out.
+
+**Confirmed, independent of all of the above:** a genuinely missing/
+unresolvable import (`missing-import/`) used to be silently swallowed into an
+empty input template by pipeline-service's local WDL parsing, rather than
+surfaced as an error. That fix doesn't depend on any of the root-relative
+theory and remains in place regardless of how the rest of this shakes out.
 
 ## Layout
 
@@ -44,6 +71,14 @@ deep-nested/
 
 missing-import/
   main.wdl             # imports a file that doesn't exist anywhere in the repo
+
+category-import/
+  workflows/
+    genomic_characterization/
+      main.wdl         # imports "../../tasks/qc/task_qc.wdl" -- UNTESTED
+  tasks/
+    qc/
+      task_qc.wdl      # two directories away from the entrypoint
 ```
 
 ### `main.wdl` (control)
@@ -61,7 +96,7 @@ live, end-to-end pass on real HealthOmics (the `align` task executed and
 printed its expected output). The directory name is a holdover from when this
 was believed to be the broken case; see `main.wdl`'s own comment.
 
-### `deep-nested/main.wdl` (two layers, multiple imports -- not yet tested)
+### `deep-nested/main.wdl` (two layers, multiple imports -- confirmed working)
 
 `main.wdl` imports both `align.wdl` and `qc.wdl`. `align.wdl` is itself a
 subworkflow that imports a third file, `trim.wdl`, which `main.wdl` never
@@ -74,13 +109,22 @@ main.wdl
 `-- qc.wdl      (plain task, called via `call qc_task.qc`)
 ```
 
-This is the combination the single-layer `broken/` case doesn't cover: does
-HealthOmics correctly pull in a file that's only reachable transitively
-(main doesn't import trim.wdl, align.wdl does), and does it correctly handle
-more than one import at the same level? If this also runs cleanly, that rules
-out nesting depth and import count as explanations and points back toward
-something repo- or language-specific (Nextflow, submodules, LFS, case
-sensitivity) as the real mechanism behind the original report.
+Live-tested end to end: all three tasks ran, including `trim`'s output
+correctly flowing into `align_task` (`"Aligning World using: Trimming reads
+for World..."`), plus `qc` running independently. This rules out both nesting
+depth and import count as explanations -- HealthOmics correctly pulls in a
+file that's only reachable transitively (main doesn't import `trim.wdl`,
+`align.wdl` does) and handles multiple imports at the same level fine.
+
+### `category-import/workflows/genomic_characterization/main.wdl` (cross-directory `../` import -- untested)
+
+Imports `../../tasks/qc/task_qc.wdl`: up two directories from the entrypoint's
+own location, then back down into a sibling tree. This mirrors the real
+directory convention used by theiagen/public_health_bioinformatics (workflows
+under `workflows/<category>/`, tasks under `tasks/<category>/`, wired together
+with `../` imports per their own contributing docs) rather than the
+same-directory imports every other case here uses. Not yet tested against
+real HealthOmics -- this is the next thing worth running live.
 
 ### `missing-import/main.wdl` (genuinely missing file)
 
@@ -127,9 +171,7 @@ curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/broken/main.wdl"
 
-# Two layers, multiple imports -- the untested case. Run this one all the way
-# to a real submission (POST /v2/runs), not just /v2/description, so both
-# align_task and qc actually execute and produce output.
+# Two layers, multiple imports -- confirmed working; expect success here too.
 curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/deep-nested/main.wdl"
@@ -138,9 +180,23 @@ curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
 curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/missing-import/main.wdl"
+
+# Cross-directory "../" import, mirroring the real theiagen repo convention --
+# UNTESTED. This is the one most likely to actually reproduce the bug report.
+curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
+  -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
+  -F "type=github" -F "engine=omics" \
+  -F "value=$BASE/category-import/workflows/genomic_characterization/main.wdl"
 ```
 
-If `deep-nested/main.wdl` also runs cleanly end-to-end (both `align_result`
-and `qc_result` populated with real command output), nesting depth and import
-count are ruled out too, and the original report likely traces to something
-this repo doesn't model yet -- worth trying the same shape in Nextflow next.
+Both `broken/` and `deep-nested/` are now confirmed working end-to-end on
+real HealthOmics (live-tested, not just description). But those only cover
+same-directory imports. `category-import/` tests the shape actually used by
+theiagen/public_health_bioinformatics -- the likely source of the original
+bug report -- importing across sibling directories via `../`. Run that one
+live before looking anywhere else; if it fails where `broken/` and
+`deep-nested/` succeeded, that's the bug, and it points at how HealthOmics's
+git-based `CreateWorkflow` scopes its checkout/zip rather than at WDL nesting
+or import count. If `category-import/` also succeeds, Nextflow's `include`
+resolution (untested -- pipeline-service's Nextflow loader doesn't parse
+`include` locally at all) is the next thing to try.
