@@ -1,18 +1,46 @@
 # healthomics-import-repro
 
-A minimal WDL project for exercising the pipeline-service bug where importing
-a workflow from GitHub for the HealthOmics engine drops subworkflows. It covers
-both halves of the fix with three small workflows.
+A minimal WDL project for investigating a pipeline-service bug report:
+importing a workflow from GitHub for the HealthOmics engine was said to drop
+subworkflows referenced via relative imports. This repo holds the test cases
+built while investigating it, including one theory that was proposed, tested
+live against real HealthOmics, and disproven -- keep reading before trusting
+old comments in this repo at face value.
+
+## Status
+
+**Confirmed working on real HealthOmics:** a nested entrypoint (`broken/`)
+importing one sibling subworkflow by relative path. Live-tested: the subworkflow
+task ran and produced real output. The theory that HealthOmics requires the
+entrypoint's imports to be relative to the repo root (unlike Cromwell) is
+**disproven** -- HealthOmics resolves relative imports the normal WDL way, same
+as Cromwell, at least for this case.
+
+**Still untested on real HealthOmics:** `deep-nested/` -- two layers of
+subworkflow nesting (a subworkflow that itself imports something) plus
+multiple imports at the entrypoint. This is the next thing to verify; the
+original bug report is still unexplained if this also turns out to work fine.
+
+**Confirmed, independent of the above:** a genuinely missing/unresolvable
+import (`missing-import/`) used to be silently swallowed into an empty input
+template by pipeline-service's local WDL parsing, rather than surfaced as an
+error. That fix is unrelated to the root-relative theory and remains in place.
 
 ## Layout
 
 ```
-main.wdl              # entrypoint at the repo root -- the control case, works everywhere
+main.wdl              # entrypoint at the repo root -- control case, works everywhere
 greet.wdl              # subworkflow task used by main.wdl
 
 broken/
-  main.wdl             # entrypoint nested one level down -- root-relative mismatch
+  main.wdl             # entrypoint nested one level down, one import -- CONFIRMED WORKING
   align.wdl            # subworkflow task used by broken/main.wdl
+
+deep-nested/
+  main.wdl             # entrypoint with TWO imports, one of which is itself nested -- UNTESTED
+  align.wdl            # a subworkflow that itself imports trim.wdl
+  qc.wdl               # a second, independent import of main.wdl
+  trim.wdl             # imported only by align.wdl, never directly by main.wdl
 
 missing-import/
   main.wdl             # imports a file that doesn't exist anywhere in the repo
@@ -20,112 +48,99 @@ missing-import/
 
 ### `main.wdl` (control)
 
-Imports `greet.wdl` with `import "greet.wdl"`. Because `main.wdl` lives at the
-repo root, "relative to the importing file" and "relative to the repo root"
-are the same path, so this works on Cromwell, on real AWS HealthOmics, and in
-pipeline-service's local WDL parsing, both before and after the fix. Use this
-to confirm the fix didn't break the normal case.
+Imports `greet.wdl` with `import "greet.wdl"`. `main.wdl` lives at the repo
+root, so this works everywhere unconditionally. Confirms the fix (or lack of
+one) didn't break the trivial case.
 
-### `broken/main.wdl` (root-relative mismatch -- the bug as reported)
+### `broken/main.wdl` (one layer, one import -- confirmed working)
 
-Imports `align.wdl` with `import "align.wdl"` -- relative to its own directory
-(`broken/`), the normal WDL-spec convention that Cromwell's `workflowUrl`-based
-HTTP import resolution also expects. It resolves fine locally (miniWDL finds
-`broken/align.wdl`) and fine on Cromwell. **AWS HealthOmics resolves the
-entrypoint's own imports relative to the repository root, not the importing
-file's directory**, so it looks for `align.wdl` at the repo root -- which
-doesn't exist -- and can't build the workflow.
+Imports `align.wdl` with `import "align.wdl"`, relative to its own directory
+(`broken/`) -- standard WDL-spec resolution, what Cromwell expects too. This
+is the simplest version of the reported bug, and it now has a confirmed,
+live, end-to-end pass on real HealthOmics (the `align` task executed and
+printed its expected output). The directory name is a holdover from when this
+was believed to be the broken case; see `main.wdl`'s own comment.
 
-Because the import resolves fine locally, pipeline-service's own
-`/v2/description` parse step has no reason to object pre-fix -- it returns a
-full, correct input template. The break only shows up later, opaquely, when
-AWS itself rejects the workflow during `create_workflow()`. The fix adds a
-pre-flight check (`WDLProjectLoader.validate_imports_relative_to_root`) that
-catches this mismatch locally, in both the describe step and workflow
-creation, instead of letting AWS fail first.
+### `deep-nested/main.wdl` (two layers, multiple imports -- not yet tested)
 
-### `missing-import/main.wdl` (genuinely missing file -- the other half of the fix)
+`main.wdl` imports both `align.wdl` and `qc.wdl`. `align.wdl` is itself a
+subworkflow that imports a third file, `trim.wdl`, which `main.wdl` never
+mentions directly:
 
-Imports `nonexistent.wdl`, which isn't anywhere in the repo. This is a true
-`WDL.Error.ImportError` even under standard (relative-to-file) resolution.
-Before the fix, `WDLProjectLoader.get_document()` caught `ImportError` in the
-same branch as lenient semantic-validation warnings and silently returned
-`None` -- `/v2/description` came back `200` with an *empty* input template,
-indistinguishable from "this workflow genuinely takes no inputs." After the
-fix, it's raised as a `ValidationException` naming the missing file.
+```
+main.wdl
+|-- align.wdl   (subworkflow, called via `call align_wf.align`)
+|     `-- trim.wdl   (align's own import)
+`-- qc.wdl      (plain task, called via `call qc_task.qc`)
+```
+
+This is the combination the single-layer `broken/` case doesn't cover: does
+HealthOmics correctly pull in a file that's only reachable transitively
+(main doesn't import trim.wdl, align.wdl does), and does it correctly handle
+more than one import at the same level? If this also runs cleanly, that rules
+out nesting depth and import count as explanations and points back toward
+something repo- or language-specific (Nextflow, submodules, LFS, case
+sensitivity) as the real mechanism behind the original report.
+
+### `missing-import/main.wdl` (genuinely missing file)
+
+Imports `nonexistent.wdl`, which isn't anywhere in the repo -- a true
+`WDL.Error.ImportError` under standard resolution, not a root-vs-file
+question. Before the fix, pipeline-service's `WDLProjectLoader.get_document()`
+caught `ImportError` in the same branch as lenient semantic-validation
+warnings and silently returned `None` -- `/v2/description` came back `200`
+with an *empty* input template, indistinguishable from "this workflow
+genuinely takes no inputs." After the fix, it's raised as a
+`ValidationException` naming the missing file. This part of the fix is kept
+regardless of how the root-relative question resolves.
 
 ## Setup
 
-Push this directory as its own repo (a throwaway/scratch repo is fine):
-
 ```bash
 cd healthomics-import-repro
-git init
 git add .
-git commit -m "WDL repro for HealthOmics GitHub import bug"
-git branch -M main
-git remote add origin git@github.com:<your-user>/healthomics-import-repro.git
-git push -u origin main
+git commit -m "Add deep-nested multi-import test case"
+git push
 ```
 
 If pipeline-service's GitHub integration needs a specific org/connection (AWS
-CodeConnections) to see the repo, push it wherever that connection is scoped to
-(see the `omics-github` CodeConnections setup referenced in
+CodeConnections) to see the repo, push it wherever that connection is scoped
+to (see the `omics-github` CodeConnections setup referenced in
 `lat.md/pipeline-service/engines.md`).
 
 ## Testing against pipeline-service
 
-Hit `POST /api/pipelines/v2/description` with `type=github` and `value` set to
-a GitHub blob or raw URL, `engine=omics`. Try all three entrypoints:
+Hit `POST /api/pipelines/v2/description` with `type=github`, `engine=omics`,
+and `value` set to a GitHub blob or raw URL, or submit a real run via
+`POST /api/pipelines/v2/runs` for the full end-to-end check:
 
 ```bash
 BASE="https://github.com/<your-user>/healthomics-import-repro/blob/main"
 
-# Control -- expect 200 with the "name" parameter, before and after the fix.
+# Control -- expect success, parameters/execution both fine.
 curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/main.wdl"
 
-# Root-relative mismatch.
-# Before fix: 200, full input template (looks fine; breaks later at AWS).
-# After fix:  400, ValidationException naming "align.wdl".
+# One layer, one import -- confirmed working; expect success here too.
 curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/broken/main.wdl"
 
-# Genuinely missing import.
-# Before fix: 200, EMPTY input template ({"inputs": []}).
-# After fix:  400, ValidationException naming "nonexistent.wdl".
+# Two layers, multiple imports -- the untested case. Run this one all the way
+# to a real submission (POST /v2/runs), not just /v2/description, so both
+# align_task and qc actually execute and produce output.
+curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
+  -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
+  -F "type=github" -F "engine=omics" -F "value=$BASE/deep-nested/main.wdl"
+
+# Genuinely missing import -- expect 400 naming "nonexistent.wdl".
 curl -X POST "$PIPELINE_SERVICE_URL/api/pipelines/v2/description" \
   -H "x-sc-user-id: you@example.com" -H "x-sc-access-token: $TOKEN" \
   -F "type=github" -F "engine=omics" -F "value=$BASE/missing-import/main.wdl"
 ```
 
-Re-run the `broken/main.wdl` request with `-F "engine=cromwell"` -- it should
-succeed on Cromwell both before and after the fix (Cromwell fetches `align.wdl`
-via a relative HTTP URL against `workflowUrl`, so it never hits the root-
-relative requirement). This confirms the asymmetry the original bug report
-described: Cromwell already handles it, HealthOmics doesn't.
-
-For a full end-to-end check, `POST /api/pipelines/v2/runs` with the same
-`workflow_entrypoint` values and `engine=omics`. `broken/main.wdl` and
-`missing-import/main.wdl` should now fail fast with the same
-`ValidationException`/400 during `create_workflow()`, instead of reaching AWS
-and failing opaquely (or, for `missing-import`, instead of silently trying to
-create a workflow nobody actually validated).
-
-## A known gap to be aware of
-
-The pre-flight check (and pipeline-service's local WDL parsing generally) can
-only validate the *standard* WDL resolution rule -- relative to the importing
-file. AWS's "resolve the entrypoint's imports relative to the repo root" rule
-means a workflow with a **nested** main file that deliberately writes its
-imports as root-relative text (e.g. `broken/main.wdl` importing
-`"broken/align.wdl"` instead of `"align.wdl"`) would actually run fine on real
-HealthOmics, but pipeline-service's local miniWDL parse can't resolve that
-import at all (miniWDL only knows "relative to the importing file", not "repo
-root") and will now raise `ValidationException` for it via the
-`WDL.Error.ImportError` fix -- a false rejection of an AWS-valid layout. In
-practice this is avoided by keeping the main file at the repo root, as
-`main.wdl` above does -- which is also the simplest thing to tell a user who
-hits the new validation error.
+If `deep-nested/main.wdl` also runs cleanly end-to-end (both `align_result`
+and `qc_result` populated with real command output), nesting depth and import
+count are ruled out too, and the original report likely traces to something
+this repo doesn't model yet -- worth trying the same shape in Nextflow next.
